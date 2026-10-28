@@ -86,21 +86,18 @@ uv run relay demo
 
 ## Tested on
 
-Device name	LAPTOP-OGVE8HOG
-Processor	11th Gen Intel(R) Core(TM) i5-11300H @ 3.10GHz (3.11 GHz)
-Installed RAM	8.00 GB (7.75 GB usable)
-Graphics card	NVIDIA GeForce GTX 1650 (4 GB)
-Intel(R) Iris(R) Xe Graphics (128 MB)
-Storage	212 GB of 477 GB used
-Device ID	1FAE45B2-445E-4FDD-8450-E5CCDDD5915B
-Product ID	00356-24508-84949-AAOEM
-System type	64-bit operating system, x64-based processor
-Pen and touch	No pen or touch input is available for this display
+| Specification | Details |
+|---|---|
+| **Device** | `LAPTOP-OGVE8HOG` (64-bit Windows 11) |
+| **Processor** | 11th Gen Intel(R) Core(TM) i5-11300H @ 3.10GHz (4 cores / 8 threads) |
+| **RAM** | 8.00 GB (7.75 GB usable) |
+| **Graphics** | NVIDIA GeForce GTX 1650 (4 GB VRAM) + Intel(R) Iris(R) Xe |
+| **Storage** | SSD (~250 GB free on D: drive) |
 
 
 | Step | Time |
 |---|---|
-| `make demo` from an empty database volume (models already pulled) | **248 s** for the final run. Earlier clean runs took 349 s, and one took 1,181 s because a single Ollama call stalled for about 12 minutes (laptop throttling); it was recorded as a `timeout` and the gateway fell back. |
+| `make demo` from an empty database volume (models already pulled) | **135 s** on GTX 1650 (24 tickets processed in 131.7 s worker time). |
 | Per ticket | Triage about 3 s, drafting about 8–17 s; escalations finish in 3–5 s because nothing is drafted. |
 | `make eval RUNS=5` | About 85 s per run plus about 70 s of injection probes, roughly 9 minutes in total. |
 | `make test` | About 15 s. |
