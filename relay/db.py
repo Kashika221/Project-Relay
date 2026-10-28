@@ -1,202 +1,110 @@
-"""Database layer for Project Relay with PostgreSQL RLS, pgvector, and fail-closed isolation."""
-import os
-import json
-import logging
-from typing import List, Dict, Any, Optional
-from relay.config import config
-from relay.contracts import KBPassage
+"""Database access.
 
-logger = logging.getLogger("relay.db")
-
-SCHEMA_SQL = """
--- Extensions
-CREATE EXTENSION IF NOT EXISTS vector;
-
--- Non-superuser application role
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'relay_app') THEN
-        CREATE ROLE relay_app WITH LOGIN PASSWORD 'relay_secret';
-    END IF;
-END $$;
-
--- Knowledge Base Table
-CREATE TABLE IF NOT EXISTS knowledge_base (
-    id VARCHAR(32) PRIMARY KEY,
-    tenant VARCHAR(32) NOT NULL,
-    title TEXT NOT NULL,
-    body TEXT NOT NULL,
-    internal BOOLEAN DEFAULT FALSE,
-    embedding vector(768)
-);
-
--- Enable & FORCE Row-Level Security
-ALTER TABLE knowledge_base ENABLE ROW LEVEL SECURITY;
-ALTER TABLE knowledge_base FORCE ROW LEVEL SECURITY;
-
--- Drop existing policy if any
-DROP POLICY IF EXISTS kb_tenant_isolation_policy ON knowledge_base;
-
--- Fail-closed tenant isolation policy:
-CREATE POLICY kb_tenant_isolation_policy ON knowledge_base
-    FOR ALL
-    TO relay_app
-    USING (tenant = NULLIF(current_setting('app.tenant_id', true), ''));
-
--- Durable Work Queue
-CREATE TABLE IF NOT EXISTS ticket_queue (
-    id SERIAL PRIMARY KEY,
-    ticket_id VARCHAR(64) UNIQUE NOT NULL,
-    tenant VARCHAR(32) NOT NULL,
-    payload JSONB NOT NULL,
-    status VARCHAR(32) DEFAULT 'queued',
-    attempts INT DEFAULT 0,
-    locked_until TIMESTAMPTZ,
-    locked_by VARCHAR(64),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Outbox with Idempotency
-CREATE TABLE IF NOT EXISTS outbox (
-    ticket_id VARCHAR(64) PRIMARY KEY,
-    tenant VARCHAR(32) NOT NULL,
-    text TEXT NOT NULL,
-    approved_by VARCHAR(64) NOT NULL,
-    approved_at TIMESTAMPTZ NOT NULL,
-    idempotency_key VARCHAR(128) UNIQUE NOT NULL
-);
-
--- Cases Table
-CREATE TABLE IF NOT EXISTS cases (
-    id SERIAL PRIMARY KEY,
-    ticket_id VARCHAR(64) NOT NULL,
-    tenant VARCHAR(32) NOT NULL,
-    owner VARCHAR(64) NOT NULL,
-    severity VARCHAR(32) NOT NULL,
-    reason TEXT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Audit Log Table
-CREATE TABLE IF NOT EXISTS audit_log (
-    id SERIAL PRIMARY KEY,
-    ticket_id VARCHAR(64) NOT NULL,
-    action VARCHAR(64) NOT NULL,
-    actor VARCHAR(64) NOT NULL,
-    reason TEXT,
-    timestamp TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Model Call Metering Table
-CREATE TABLE IF NOT EXISTS model_calls (
-    id SERIAL PRIMARY KEY,
-    ticket_id VARCHAR(64),
-    model VARCHAR(64) NOT NULL,
-    tokens_in INT NOT NULL,
-    tokens_out INT NOT NULL,
-    latency_ms INT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Grants for application user
-GRANT USAGE ON SCHEMA public TO relay_app;
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO relay_app;
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO relay_app;
+All tenant data is read and written inside `tenant_tx`, which sets the
+transaction-local `app.tenant_id` that the RLS policies check. There is no
+helper that runs a tenant query without it: forgetting the tenant gives zero
+rows, not every tenant's rows.
 """
 
-class Database:
-    def __init__(self, db_url: Optional[str] = None):
-        self.db_url = db_url or config.database_url
-        self._mock_kb: List[Dict[str, Any]] = []
+from __future__ import annotations
 
-    @property
-    def is_mock(self) -> bool:
-        return config.mock_llm or (os.getenv("MOCK_LLM", "false").lower() in ("true", "1", "yes"))
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
 
-    def init_schema(self, admin_url: Optional[str] = None):
-        """Initializes tables, pgvector, roles, and RLS policies using admin connection."""
-        if self.is_mock:
-            return
-        url = admin_url or config.admin_database_url
-        try:
-            import psycopg
-            with psycopg.connect(url, connect_timeout=2, autocommit=True) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(SCHEMA_SQL)
-            logger.info("Database schema and RLS policies successfully applied.")
-        except Exception as e:
-            logger.warning(f"Could not initialize PostgreSQL schema: {e}")
+import psycopg
+from psycopg import sql
+from psycopg.rows import dict_row
 
-    def seed_kb(self, kb_items: List[Dict[str, Any]]):
-        """Seeds KB items and embeddings into knowledge_base table."""
-        self._mock_kb = kb_items
-        if self.is_mock:
-            return
+from relay.config import ROOT, Settings
 
-        try:
-            import psycopg
-            with psycopg.connect(self.db_url, connect_timeout=2, autocommit=True) as conn:
-                with conn.cursor() as cur:
-                    for item in kb_items:
-                        emb = item.get("embedding")
-                        cur.execute(
-                            """
-                            INSERT INTO knowledge_base (id, tenant, title, body, internal, embedding)
-                            VALUES (%s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (id) DO UPDATE SET
-                                title = EXCLUDED.title,
-                                body = EXCLUDED.body,
-                                internal = EXCLUDED.internal,
-                                embedding = EXCLUDED.embedding;
-                            """,
-                            (item["id"], item["tenant"], item["title"], item["body"], item.get("internal", False), str(emb) if emb else None)
-                        )
-        except Exception as e:
-            logger.debug(f"Postgres seed skipped (using in-memory KB): {e}")
+MIGRATIONS = ROOT / "migrations"
 
-    def retrieve_passages(self, tenant: str, query_embedding: List[float], top_k: int = 3) -> List[KBPassage]:
-        """
-        Retrieves top-k relevant non-internal KB passages using pgvector under tenant RLS.
-        """
-        if self.is_mock:
-            return self._mock_retrieve(tenant, top_k)
 
-        try:
-            import psycopg
-            with psycopg.connect(self.db_url, connect_timeout=2) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SET LOCAL app.tenant_id = %s;", (tenant,))
-                    emb_str = f"[{','.join(map(str, query_embedding))}]"
-                    cur.execute(
-                        """
-                        SELECT id, title, body, (embedding <=> %s::vector) AS score
-                        FROM knowledge_base
-                        WHERE internal = FALSE
-                        ORDER BY score ASC
-                        LIMIT %s;
-                        """,
-                        (emb_str, top_k)
-                    )
-                    rows = cur.fetchall()
-                    return [KBPassage(kb_id=r[0], title=r[1], text=r[2], score=float(r[3])) for r in rows]
-        except Exception:
-            return self._mock_retrieve(tenant, top_k)
+class UnknownTenant(Exception):
+    pass
 
-    def _mock_retrieve(self, tenant: str, top_k: int) -> List[KBPassage]:
-        results = []
-        for item in self._mock_kb:
-            if item.get("tenant") == tenant and not item.get("internal", False):
-                results.append(KBPassage(
-                    kb_id=item["id"],
-                    title=item["title"],
-                    text=item["body"],
-                    score=0.15
-                ))
-        if not results:
-            # Fallback default KB reference if in-memory KB wasn't explicitly seeded
-            kb_id = "NW-KB-01" if tenant == "northwind" else "HD-KB-01"
-            title = "Returns & Delivery" if tenant == "northwind" else "Appointments"
-            text = "Standard policy details."
-            results.append(KBPassage(kb_id=kb_id, title=title, text=text, score=0.15))
-        return results[:top_k]
+
+def connect(settings: Settings, *, admin: bool = False) -> psycopg.Connection:
+    url = settings.database_admin_url if admin else settings.database_url
+    return psycopg.connect(url, row_factory=dict_row, autocommit=False)
+
+
+@contextmanager
+def tenant_tx(conn: psycopg.Connection, tenant_id: str) -> Iterator[psycopg.Cursor]:
+    """Open a transaction bound to one tenant. Commits on success, rolls back on error."""
+    if not tenant_id:
+        raise UnknownTenant("empty tenant id")
+    with conn.transaction():
+        with conn.cursor() as cur:
+            # set_config(..., true) is SET LOCAL: it ends with the transaction,
+            # so a pooled connection can never carry a tenant into the next one.
+            cur.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_id,))
+            yield cur
+
+
+@contextmanager
+def global_tx(conn: psycopg.Connection) -> Iterator[psycopg.Cursor]:
+    """Transaction with no tenant: only tenant-free tables are visible."""
+    with conn.transaction():
+        with conn.cursor() as cur:
+            yield cur
+
+
+def known_tenants(conn: psycopg.Connection) -> dict[str, dict]:
+    with global_tx(conn) as cur:
+        cur.execute("SELECT id, name, aliases FROM tenants ORDER BY id")
+        return {r["id"]: r for r in cur.fetchall()}
+
+
+def migrate(settings: Settings, *, admin_url: str | None = None) -> list[str]:
+    """Create the app role and apply pending migrations in order. Idempotent."""
+    applied: list[str] = []
+    with psycopg.connect(admin_url or settings.database_admin_url, autocommit=True) as conn:
+        conn.execute(
+            """
+            DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'relay_app') THEN
+                    CREATE ROLE relay_app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE;
+                END IF;
+            END $$;
+            """
+        )
+        conn.execute(
+            sql.SQL("ALTER ROLE relay_app WITH LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD {}").format(
+                sql.Literal(settings.app_password)
+            )
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, applied_at timestamptz DEFAULT now())"
+        )
+        done = {r[0] for r in conn.execute("SELECT name FROM schema_migrations").fetchall()}
+        for path in sorted(Path(MIGRATIONS).glob("*.sql")):
+            if path.name in done:
+                continue
+            with conn.transaction():
+                conn.execute(path.read_text(encoding="utf-8"))
+                conn.execute("INSERT INTO schema_migrations (name) VALUES (%s)", (path.name,))
+            applied.append(path.name)
+    return applied
+
+
+def audit(
+    cur: psycopg.Cursor,
+    tenant_id: str,
+    ticket_id: str | None,
+    actor: str,
+    action: str,
+    *,
+    from_state: str | None = None,
+    to_state: str | None = None,
+    reason: str | None = None,
+    details: dict | None = None,
+) -> None:
+    from psycopg.types.json import Jsonb
+
+    cur.execute(
+        """INSERT INTO audit_log (tenant_id, ticket_id, actor, action, from_state, to_state, reason, details)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+        (tenant_id, ticket_id, actor, action, from_state, to_state, reason, Jsonb(details or {})),
+    )

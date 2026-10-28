@@ -1,24 +1,42 @@
-.PHONY: setup demo run eval test lint clean report
+# Every target is a thin wrapper around `uv run relay ...`, so the same steps
+# work without make (see README, "Without make").
+INBOX ?= data/northwind/tickets.jsonl
+RUNS ?= 5
+RELAY = uv run relay
 
-PYTHON ?= python
+.PHONY: demo up down run worker eval test list report clean-db
 
-setup:
-	$(PYTHON) -m pip install -r requirements.txt
+up:
+	docker compose up -d --wait
 
-demo:
-	$(PYTHON) -m relay.cli demo
+down:
+	docker compose down
 
-run:
-	$(PYTHON) -m relay.cli run --inbox $(INBOX)
+demo: up
+	uv sync --quiet
+	$(RELAY) demo
 
-eval:
-	$(PYTHON) -m relay.cli eval --runs $(or $(RUNS),5)
+run: up
+	$(RELAY) migrate
+	$(RELAY) run --inbox $(INBOX)
 
-test:
-	$(PYTHON) -m pytest tests -v
+worker:
+	$(RELAY) worker
+
+eval: up
+	$(RELAY) migrate
+	$(RELAY) seed
+	$(RELAY) eval --runs $(RUNS)
+
+test: up
+	uv run --group dev pytest
+
+list:
+	$(RELAY) list
 
 report:
-	$(PYTHON) -m relay.cli report --view $(or $(VIEW),internal)
+	$(RELAY) report --view internal
 
-clean:
-	rm -rf out/*.jsonl eval/runs/*.jsonl .pytest_cache
+# Drops the database volume: every ticket, decision and audit row is lost.
+clean-db:
+	docker compose down -v

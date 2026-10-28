@@ -1,230 +1,313 @@
-"""Unified CLI for Project Relay: demo, run, approve, reject, list, eval, and report."""
+"""relay: command line for operators.
+
+  relay demo                         migrate, seed, process both sample inboxes, print the approval queue
+  relay run --inbox FILE [...]       ingest any inbox in the Appendix B format and process it
+  relay worker                       drain the queue (safe to run several, safe to kill)
+  relay list | show | approve | reject   the human approval gate
+  relay eval --runs N                triage + routing over the golden set, writes eval/ and docs/EVAL.md
+  relay report --view internal|client [--tenant X]
+  relay requeue-held                 re-queue tickets held for budget after raising the budget
+  relay doctor                       check Postgres and Ollama
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
-import os
 import sys
-import uuid
+import time
 from pathlib import Path
-from typing import Optional
-import typer
-from rich.console import Console
-from rich.table import Table
 
-from relay.config import config
-from relay.contracts import TicketInput, DecisionRecord
-from relay.agents import LeadOrchestrator
-from relay.gateway import ModelGateway
-from relay.db import Database
-from relay.checker import DeterministicChecker
-from relay.approval import ApprovalManager
-from relay.eval import Evaluator
+import httpx
+import psycopg
 
-app = typer.Typer(name="relay", help="Project Relay: Multi-Tenant AI Agent Support Desk")
-console = Console()
+from relay import approval, export, queue
+from relay.config import ROOT, Settings, load_settings
+from relay.db import audit, connect, known_tenants, migrate, tenant_tx
+from relay.gateway import Gateway, make_provider
+from relay.ingest import ingest_file
+from relay.runs import create_run, finish_run
+from relay.seed import seed
+from relay.worker import Worker
 
-@app.command()
-def demo():
-    """C1: One command demo. Seeds KBs, processes both inboxes, prints approval queue."""
-    console.print("[bold green]Starting Project Relay Demo...[/bold green]")
-    db = Database()
-    
-    # 1. Seed Knowledge Bases
-    kb_data = []
-    for tenant in ["northwind", "harbor"]:
-        kb_file = Path("data") / tenant / "kb.jsonl"
-        if kb_file.exists():
-            with open(kb_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        kb_data.append(json.loads(line))
-    db.seed_kb(kb_data)
-    console.print(f"[cyan]Loaded and seeded {len(kb_data)} KB articles.[/cyan]")
+DEMO_INBOXES = [ROOT / "data" / "northwind" / "tickets.jsonl", ROOT / "data" / "harbor" / "tickets.jsonl"]
 
-    # 2. Process both inboxes
-    inbox_files = [Path("data/northwind/tickets.jsonl"), Path("data/harbor/tickets.jsonl")]
-    run_id = f"demo-{uuid.uuid4().hex[:6]}"
-    
-    out_dir = Path("out")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    decisions_path = out_dir / "decisions.jsonl"
 
-    gateway = ModelGateway()
-    lead = LeadOrchestrator(gateway, db, DeterministicChecker())
+def _gateway(settings: Settings, conn: psycopg.Connection) -> Gateway:
+    return Gateway(settings, make_provider(settings), conn)
 
-    total_processed = 0
-    with open(decisions_path, "w", encoding="utf-8") as df:
-        for ibox in inbox_files:
-            if not ibox.exists():
-                continue
-            with open(ibox, "r", encoding="utf-8") as inf:
-                for line in inf:
-                    if not line.strip():
-                        continue
-                    ticket = TicketInput.model_validate_json(line)
-                    dec = lead.process_ticket(ticket, run_id=run_id)
-                    df.write(dec.model_dump_json() + "\n")
-                    total_processed += 1
 
-    console.print(f"[bold green]Successfully processed {total_processed} tickets into out/decisions.jsonl[/bold green]")
+def cmd_doctor(settings: Settings, _args=None) -> int:
+    ok = True
+    try:
+        with psycopg.connect(settings.database_admin_url, connect_timeout=5) as c:
+            c.execute("SELECT 1")
+        print(f"[ok] postgres reachable ({settings.database_admin_url.split('@')[-1]})")
+    except psycopg.Error as e:
+        ok = False
+        print(f"[fail] postgres: {str(e).strip().splitlines()[0]}\n       start it with: docker compose up -d --wait")
+    if settings.model_provider == "ollama":
+        try:
+            tags = httpx.get(f"{settings.ollama_url}/api/tags", timeout=5).json()
+            have = {m["name"] for m in tags.get("models", [])}
+            have |= {n.removesuffix(":latest") for n in have}
+            for m in sorted({settings.model_triage, settings.model_draft, settings.model_embed}):
+                if m in have:
+                    print(f"[ok] model {m}")
+                else:
+                    ok = False
+                    print(f"[fail] model {m} missing: run  ollama pull {m}")
+        except httpx.HTTPError as e:
+            ok = False
+            print(f"[fail] ollama at {settings.ollama_url}: {e}\n       start it with: ollama serve")
+    else:
+        print(f"[ok] model provider: {settings.model_provider} (no Ollama needed)")
+    return 0 if ok else 1
 
-    # 3. Print Approval Queue
-    list_queue()
 
-@app.command("run")
-def run_inbox(inbox: str = typer.Option(..., "--inbox", "-i", help="Path to input tickets JSONL file")):
-    """C7: Processes any input tickets JSONL file idempotently."""
-    inbox_path = Path(inbox)
-    if not inbox_path.exists():
-        console.print(f"[red]Error: inbox file '{inbox}' does not exist.[/red]")
-        sys.exit(1)
+def cmd_migrate(settings: Settings, _args=None) -> int:
+    applied = migrate(settings)
+    print(f"migrations applied: {', '.join(applied) if applied else 'none (up to date)'}")
+    return 0
 
-    out_dir = Path("out")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    decisions_path = out_dir / "decisions.jsonl"
 
-    # Read existing decision ticket IDs to avoid duplicates
-    existing_ids = set()
-    if decisions_path.exists():
-        with open(decisions_path, "r", encoding="utf-8") as df:
-            for line in df:
-                if line.strip():
-                    existing_ids.add(json.loads(line).get("ticket_id"))
+def cmd_seed(settings: Settings, _args=None) -> int:
+    with connect(settings) as conn:
+        run_id = create_run(conn, "seed", settings.token_budget_run)
+        counts = seed(conn, _gateway(settings, conn), run_id)
+        finish_run(conn, run_id)
+    print("seeded KB articles (re-embedded): " + ", ".join(f"{t}={n}" for t, n in counts.items()))
+    return 0
 
-    db = Database()
-    gateway = ModelGateway()
-    lead = LeadOrchestrator(gateway, db, DeterministicChecker())
-    run_id = f"run-{uuid.uuid4().hex[:6]}"
 
-    processed = 0
-    with open(decisions_path, "a", encoding="utf-8") as df:
-        with open(inbox_path, "r", encoding="utf-8") as inf:
-            for line in inf:
-                if not line.strip():
-                    continue
-                ticket = TicketInput.model_validate_json(line)
-                if ticket.id in existing_ids:
-                    continue
-                dec = lead.process_ticket(ticket, run_id=run_id)
-                df.write(dec.model_dump_json() + "\n")
-                existing_ids.add(ticket.id)
-                processed += 1
+def _process(settings: Settings, inboxes: list[Path], kind: str) -> int:
+    with connect(settings) as conn:
+        run_id = create_run(conn, kind, settings.token_budget_run)
+        print(f"run {run_id}")
+        for path in inboxes:
+            stats = ingest_file(conn, settings, path, run_id)
+            print(f"ingested {path.relative_to(ROOT) if path.is_relative_to(ROOT) else path}: "
+                  f"{stats.accepted} new, {stats.duplicates} already known, {len(stats.rejected)} rejected")
+            for r in stats.rejected:
+                print(f"  rejected line {r['line']} ({r['ticket_id']}): {r['reason']}")
+        started = time.perf_counter()
+        counts = Worker(settings, conn, _gateway(settings, conn)).run_until_empty()
+        finish_run(conn, run_id)
+        written = export.export_all(conn)
+        print(f"worker: {counts['done']} done, {counts['retry']} retried, {counts['dead']} dead-lettered "
+              f"in {time.perf_counter() - started:.1f}s")
+        print(f"wrote out/decisions.jsonl ({written['decisions']} rows), out/outbox.jsonl ({written['outbox']} rows)")
+        _print_queue(conn)
+    return 0
 
-    console.print(f"[green]Processed {processed} new tickets from {inbox_path}.[/green]")
 
-@app.command("list")
-def list_queue():
-    """C5: Lists all tickets awaiting human approval."""
-    mgr = ApprovalManager()
-    pending = mgr.list_pending()
-    
-    table = Table(title="Project Relay: Approval Queue (Pending Human Review)")
-    table.add_column("Ticket ID", style="bold cyan")
-    table.add_column("Tenant", style="magenta")
-    table.add_column("Category", style="yellow")
-    table.add_column("Priority", style="red")
-    table.add_column("Action", style="green")
-    table.add_column("Status", style="blue")
-    table.add_column("Draft Preview", style="white")
+def cmd_run(settings: Settings, args) -> int:
+    paths = [Path(p) for p in args.inbox]
+    for p in paths:
+        if not p.exists():
+            print(f"inbox not found: {p}", file=sys.stderr)
+            return 2
+    return _process(settings, paths, "run")
 
-    for p in pending:
-        preview = (p.draft_reply[:60] + "...") if p.draft_reply else "None"
-        table.add_row(p.ticket_id, p.tenant, p.category, p.priority, p.action, p.status, preview)
 
-    console.print(table)
+def cmd_demo(settings: Settings, _args=None) -> int:
+    started = time.perf_counter()
+    if cmd_doctor(settings) != 0:
+        return 1
+    cmd_migrate(settings)
+    cmd_seed(settings)
+    code = _process(settings, DEMO_INBOXES, "demo")
+    print(f"demo finished in {time.perf_counter() - started:.0f}s")
+    return code
 
-@app.command("show")
-def show_ticket(ticket_id: str):
-    """C5: Shows full decision details for a ticket."""
-    mgr = ApprovalManager()
-    dec = mgr.show(ticket_id)
-    if not dec:
-        console.print(f"[red]Ticket '{ticket_id}' not found.[/red]")
+
+def cmd_worker(settings: Settings, args) -> int:
+    with connect(settings) as conn:
+        counts = Worker(settings, conn, _gateway(settings, conn)).run_until_empty(max_jobs=args.max_jobs)
+        export.export_all(conn)
+    print(f"worker: {counts}")
+    return 0
+
+
+def _print_queue(conn: psycopg.Connection, tenant: str | None = None) -> None:
+    rows = approval.pending(conn, tenant)
+    print(f"\nAPPROVAL QUEUE ({len(rows)} awaiting a human)")
+    if not rows:
         return
-    console.print(dec.model_dump_json(indent=2))
+    print(f"{'TICKET':<8} {'TENANT':<10} {'ACTION':<13} {'CATEGORY':<18} {'PRIO':<7} DRAFT")
+    for r in rows:
+        draft = " ".join(r["draft"].split())
+        print(f"{r['ticket_id']:<8} {r['tenant_id']:<10} {r['action']:<13} {r['category']:<18} {r['priority']:<7} "
+              f"{draft[:70]}{'...' if len(draft) > 70 else ''}")
+    print("\nnext: relay show <ticket> | relay approve <ticket> | relay reject <ticket> --reason \"...\"")
 
-@app.command("approve")
-def approve_ticket(ticket_id: str, approver: str = "human_operator"):
-    """C5: Approves a ticket draft, writing exactly-once to outbox.jsonl."""
-    mgr = ApprovalManager()
-    res = mgr.approve(ticket_id, approver=approver)
-    if res:
-        console.print(f"[bold green]Ticket {ticket_id} approved by {approver}![/bold green]")
-        console.print(f"Idempotency Key: {res.idempotency_key}")
-    else:
-        console.print(f"[yellow]Ticket {ticket_id} could not be approved (already approved or not pending).[/yellow]")
 
-@app.command("reject")
-def reject_ticket(ticket_id: str, reason: str = typer.Option(..., "--reason", "-r", help="Reason for rejection"), approver: str = "human_operator"):
-    """C5: Rejects a draft with an audited reason and sends it back to the drafter."""
-    mgr = ApprovalManager()
-    ok = mgr.reject(ticket_id, reason=reason, approver=approver)
-    if ok:
-        console.print(f"[bold red]Ticket {ticket_id} rejected. Reason: '{reason}'[/bold red]")
-    else:
-        console.print(f"[red]Ticket {ticket_id} not found.[/red]")
+def cmd_list(settings: Settings, args) -> int:
+    with connect(settings) as conn:
+        _print_queue(conn, args.tenant)
+        escalated = []
+        for t in [args.tenant] if args.tenant else list(known_tenants(conn)):
+            with tenant_tx(conn, t) as cur:
+                cur.execute("""SELECT c.ticket_id, c.tenant_id, c.owner, c.severity, c.reason FROM cases c
+                               WHERE c.status = 'open' ORDER BY c.severity, c.ticket_id""")
+                escalated.extend(cur.fetchall())
+        print(f"\nOPEN CASES ({len(escalated)})")
+        for c in escalated:
+            print(f"{c['ticket_id']:<8} {c['tenant_id']:<10} {c['severity']:<5} {c['owner']:<17} {c['reason'][:80]}")
+    return 0
 
-@app.command("eval")
-def run_evaluation(runs: int = 5):
-    """E3: Runs evaluation harness over golden set N times and writes docs/EVAL.md."""
-    console.print(f"[cyan]Running evaluation harness ({runs} runs)...[/cyan]")
-    evaluator = Evaluator(data_dir=Path("data"), out_eval_dir=Path("eval/runs"))
-    evaluator.run_eval(num_runs=runs)
-    console.print("[bold green]Evaluation complete! Output written to eval/runs/ and docs/EVAL.md[/bold green]")
 
-@app.command("report")
-def generate_report(
-    view: str = typer.Option("internal", "--view", "-v", help="View type: internal or client"),
-    tenant: Optional[str] = typer.Option(None, "--tenant", "-t", help="Tenant filter for client view (northwind or harbor)")
-):
-    """S2: Generates internal telemetry report or client-facing summary."""
-    decisions_path = Path("out/decisions.jsonl")
-    if not decisions_path.exists():
-        console.print("[yellow]No decisions found in out/decisions.jsonl[/yellow]")
-        return
+def cmd_show(settings: Settings, args) -> int:
+    with connect(settings) as conn:
+        info = approval.show(conn, args.ticket, args.tenant)
+    t, d = info["ticket"], info["decision"]
+    print(f"{t['ticket_id']} [{t['tenant_id']}] state={t['state']}  from {t['customer_ref']}  received {t['received_at']}")
+    print(f"subject: {t['subject']}\nbody:    {t['body']}\n")
+    if d:
+        print(f"decision: action={d['action']} status={d['status']} category={d['category']} priority={d['priority']} "
+              f"injection={d['injection_detected']} kb_refs={list(d['kb_refs'])}")
+        print(f"          model={d['model']} tokens={d['tokens_in']}+{d['tokens_out']} latency={d['latency_ms']}ms")
+        reasons = d["trace"].get("routing", {}).get("reasons", [])
+        if reasons:
+            print(f"          why: {'; '.join(reasons)}")
+    for a in info["approvals"]:
+        print(f"\ndraft v{a['version']} ({a['action']}) [{a['state']}]"
+              + (f" by {a['decided_by']}: {a['reason'] or ''}" if a["decided_by"] else ""))
+        print(f"  {a['draft']}")
+    for c in info["cases"]:
+        print(f"\ncase #{c['id']} [{c['status']}] {c['severity']} owner={c['owner']} source={c['source']}\n  {c['reason']}")
+    if info["outbox"]:
+        o = info["outbox"]
+        print(f"\noutbox: sent, approved by {o['approved_by']} at {o['approved_at']} ({o['idempotency_key']})")
+    print("\naudit:")
+    for a in info["audit"]:
+        arrow = f"{a['from_state'] or ''}->{a['to_state']}" if a["to_state"] else ""
+        print(f"  {a['at']:%Y-%m-%d %H:%M:%S} {a['actor']:<22} {a['action']:<22} {arrow:<30} {a['reason'] or ''}")
+    return 0
 
-    decisions = []
-    with open(decisions_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                decisions.append(json.loads(line))
 
-    if view == "internal":
-        table = Table(title="Project Relay: Internal Telemetry Report")
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="green")
+def cmd_approve(settings: Settings, args) -> int:
+    with connect(settings) as conn:
+        try:
+            res = approval.approve(conn, args.ticket, args.by or settings.operator, args.tenant)
+        except approval.ApprovalError as e:
+            print(f"not approved: {e}", file=sys.stderr)
+            return 1
+        export.export_all(conn)
+    print(f"approved {res['tenant']}/{res['ticket_id']} v{res['version']} -> out/outbox.jsonl ({res['idempotency_key']})")
+    return 0
 
-        total_tokens_in = sum(d.get("tokens_in", 0) for d in decisions)
-        total_tokens_out = sum(d.get("tokens_out", 0) for d in decisions)
-        avg_latency = sum(d.get("latency_ms", 0) for d in decisions) / max(len(decisions), 1)
 
-        table.add_row("Total Tickets Processed", str(len(decisions)))
-        table.add_row("Total Input Tokens", str(total_tokens_in))
-        table.add_row("Total Output Tokens", str(total_tokens_out))
-        table.add_row("Average Latency", f"{avg_latency:.1f} ms")
-        table.add_row("Escalated Tickets", str(sum(1 for d in decisions if d.get("action") == "escalate")))
-        console.print(table)
+def cmd_reject(settings: Settings, args) -> int:
+    with connect(settings) as conn:
+        try:
+            res = approval.reject(conn, settings, args.ticket, args.by or settings.operator, args.reason, args.tenant)
+        except approval.ApprovalError as e:
+            print(f"not rejected: {e}", file=sys.stderr)
+            return 1
+        print(f"rejected {res['tenant']}/{res['ticket_id']} -> {res['next']}")
+        if res["next"] == "redrafting" and not args.no_redraft:
+            Worker(settings, conn, _gateway(settings, conn)).run_until_empty()
+            info = approval.show(conn, args.ticket, res["tenant"])
+            latest = info["approvals"][-1]
+            if latest["state"] == "pending":
+                print(f"new draft v{latest['version']} awaiting approval:\n  {latest['draft']}")
+            else:
+                print(f"redraft did not pass the checker; ticket is now {info['ticket']['state']}")
+        export.export_all(conn)
+    return 0
 
-    elif view == "client":
-        if not tenant:
-            console.print("[red]Error: --tenant must be specified for client view.[/red]")
-            return
-        
-        tenant_decs = [d for d in decisions if d.get("tenant") == tenant]
-        table = Table(title=f"Project Relay: Client Summary Report ({tenant.title()})")
-        table.add_column("Category", style="yellow")
-        table.add_column("Action", style="green")
-        table.add_column("Count", style="cyan")
 
-        counts = {}
-        for d in tenant_decs:
-            key = (d.get("category", "other"), d.get("action", "unknown"))
-            counts[key] = counts.get(key, 0) + 1
+def cmd_requeue_held(settings: Settings, _args) -> int:
+    n = 0
+    with connect(settings) as conn:
+        run_id = create_run(conn, "requeue", settings.token_budget_run)
+        for t in known_tenants(conn):
+            with tenant_tx(conn, t) as cur:
+                cur.execute("DELETE FROM decisions WHERE status = 'held_budget' RETURNING ticket_id")
+                for r in cur.fetchall():
+                    queue.enqueue(cur, t, r["ticket_id"], "process", f"process:{t}:{r['ticket_id']}:{run_id}",
+                                  run_id, settings.max_attempts)
+                    cur.execute("UPDATE tickets SET state = 'received' WHERE ticket_id = %s", (r["ticket_id"],))
+                    audit(cur, t, r["ticket_id"], settings.operator, "requeued_after_budget", from_state="held_budget",
+                          to_state="received")
+                    n += 1
+    print(f"re-queued {n} held tickets; now run: relay worker")
+    return 0
 
-        for (cat, act), cnt in counts.items():
-            table.add_row(cat, act, str(cnt))
 
-        console.print(table)
-    else:
-        console.print(f"[red]Unknown view '{view}'. Choose 'internal' or 'client'.[/red]")
+def cmd_export(settings: Settings, _args) -> int:
+    with connect(settings) as conn:
+        print(json.dumps(export.export_all(conn)))
+    return 0
+
+
+def cmd_eval(settings: Settings, args) -> int:
+    from relay.evaluate import run_eval
+
+    return run_eval(settings, runs=args.runs, include_probes=not args.no_probes)
+
+
+def cmd_report(settings: Settings, args) -> int:
+    from relay.report import client_report, internal_report
+
+    with connect(settings) as conn:
+        if args.view == "client":
+            if not args.tenant:
+                print("--tenant is required for the client view", file=sys.stderr)
+                return 2
+            print(client_report(conn, args.tenant))
+        else:
+            print(internal_report(conn))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="relay", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("doctor")
+    sub.add_parser("migrate")
+    sub.add_parser("seed")
+    sub.add_parser("demo")
+    sub.add_parser("export")
+    sub.add_parser("requeue-held")
+    r = sub.add_parser("run")
+    r.add_argument("--inbox", action="append", required=True, help="ticket file (JSON Lines); repeatable")
+    w = sub.add_parser("worker")
+    w.add_argument("--max-jobs", type=int, default=None)
+    ls = sub.add_parser("list")
+    ls.add_argument("--tenant")
+    for name in ("show", "approve", "reject"):
+        s = sub.add_parser(name)
+        s.add_argument("ticket")
+        s.add_argument("--tenant")
+        if name != "show":
+            s.add_argument("--by", help="approver name (default: RELAY_OPERATOR)")
+        if name == "reject":
+            s.add_argument("--reason", required=True)
+            s.add_argument("--no-redraft", action="store_true", help="queue the redraft but do not run it now")
+    e = sub.add_parser("eval")
+    e.add_argument("--runs", type=int, default=5)
+    e.add_argument("--no-probes", action="store_true")
+    rep = sub.add_parser("report")
+    rep.add_argument("--view", choices=["internal", "client"], default="internal")
+    rep.add_argument("--tenant")
+    return p
+
+
+COMMANDS = {
+    "doctor": cmd_doctor, "migrate": cmd_migrate, "seed": cmd_seed, "demo": cmd_demo, "run": cmd_run,
+    "worker": cmd_worker, "list": cmd_list, "show": cmd_show, "approve": cmd_approve, "reject": cmd_reject,
+    "export": cmd_export, "eval": cmd_eval, "report": cmd_report, "requeue-held": cmd_requeue_held,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    args = build_parser().parse_args(argv)
+    return COMMANDS[args.cmd](load_settings(), args)
+
 
 if __name__ == "__main__":
-    app()
+    raise SystemExit(main())
