@@ -86,9 +86,17 @@ uv run relay demo
 
 ## Tested on
 
-Samsung Galaxy Book laptop (750QGK): Intel Core 7 150U (10 cores / 12 threads), 16 GB RAM, **no GPU**
-(Ollama on CPU). Windows 11 Pro, Docker Desktop (WSL2 backend), Ollama 0.40.12 native on Windows,
-Python 3.12, uv 0.12.
+Device name	LAPTOP-OGVE8HOG
+Processor	11th Gen Intel(R) Core(TM) i5-11300H @ 3.10GHz (3.11 GHz)
+Installed RAM	8.00 GB (7.75 GB usable)
+Graphics card	NVIDIA GeForce GTX 1650 (4 GB)
+Intel(R) Iris(R) Xe Graphics (128 MB)
+Storage	212 GB of 477 GB used
+Device ID	1FAE45B2-445E-4FDD-8450-E5CCDDD5915B
+Product ID	00356-24508-84949-AAOEM
+System type	64-bit operating system, x64-based processor
+Pen and touch	No pen or touch input is available for this display
+
 
 | Step | Time |
 |---|---|
